@@ -319,11 +319,10 @@ export function useGame(player: Player | null) {
     await supabase.rpc('increment_score', { p_player: 'jose', p_points: joseRoundTotal });
     await supabase.rpc('increment_score', { p_player: 'nicol', p_points: nicolRoundTotal });
 
-    setRoundResults({
-      jose: extractAnswers(joseA),
-      nicol: extractAnswers(nicolA),
-      points: { jose: jPoints, nicol: nPoints },
-    });
+    // NOTE: We do NOT call setRoundResults here.
+    // Both players (including the one who pressed Basta) will load results
+    // through the hydrateResults effect once the status changes to 'results'.
+    // This ensures both players see identical data from the DB.
 
     // Move to results (or finished if last round)
     const newStatus = gameState.current_round >= TOTAL_ROUNDS ? 'finished' : 'results';
