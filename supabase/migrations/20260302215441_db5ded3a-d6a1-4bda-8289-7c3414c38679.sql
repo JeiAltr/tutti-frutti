@@ -1,0 +1,1 @@
+ALTER TABLE public.game_state ADD COLUMN used_letters text[] NOT NULL DEFAULT '{}'::text[];
