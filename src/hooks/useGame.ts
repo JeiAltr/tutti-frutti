@@ -48,10 +48,6 @@ const normalizeLetter = (value: string | null | undefined): string | null => {
 
 const emptyAnswers: Answers = { nombre: '', apellido: '', color: '', animal: '', fruta_verdura: '', cosa: '', pais: '' };
 
-/**
- * Calculate points for a round. This is deterministic:
- * same inputs always produce same outputs.
- */
 function calculatePoints(joseA: any, nicolA: any, letter: string) {
   const jPoints: Record<string, number> = {};
   const nPoints: Record<string, number> = {};
@@ -95,18 +91,35 @@ function extractAnswers(row: any): Answers {
 }
 
 // ──────────────────────────────────────────────
-// We store the round results (answers + points) as a special row in
-// the `answers` table with player = '_round_results_'. This guarantees
-// both clients read the EXACT same results from the DB, eliminating
-// any possibility of desync due to different code versions, caching,
-// or race conditions.
+// ARCHITECTURE: Single source of truth via game_state.basta_by
+//
+// During 'basta' status:  basta_by = "jose" or "nicol"
+// During 'results'/'finished': basta_by = JSON string with full results
+//
+// Both players sync game_state via realtime + polling.
+// When they detect stored results in basta_by, they parse and display them.
+// This guarantees IDENTICAL results on both screens regardless of
+// code versions, caching, or timing.
 // ──────────────────────────────────────────────
-const RESULTS_PLAYER_KEY = '_round_results_';
 
 interface StoredRoundResults {
   jose: Answers;
   nicol: Answers;
   points: { jose: Record<string, number>; nicol: Record<string, number> };
+}
+
+/** Try to parse stored results from basta_by JSON string */
+function tryParseStoredResults(bastaBy: string | null): StoredRoundResults | null {
+  if (!bastaBy || bastaBy === 'jose' || bastaBy === 'nicol') return null;
+  try {
+    const parsed = JSON.parse(bastaBy);
+    if (parsed && parsed.jose && parsed.nicol && parsed.points) {
+      return parsed as StoredRoundResults;
+    }
+  } catch {
+    // Not JSON, just a player name
+  }
+  return null;
 }
 
 export function useGame(player: Player | null) {
@@ -128,6 +141,13 @@ export function useGame(player: Player | null) {
 
     const applyGameState = (data: any) => {
       if (!data || !isMounted) return;
+
+      // *** KEY: extract stored results from basta_by ***
+      const storedResults = tryParseStoredResults(data.basta_by);
+      if (storedResults) {
+        setRoundResults(storedResults);
+      }
+
       setGameState({
         ...data,
         current_letter: normalizeLetter(data.current_letter),
@@ -236,14 +256,12 @@ export function useGame(player: Player | null) {
   const pressBasta = useCallback(async () => {
     if (!player || !gameState) return;
 
-    // Upsert my answers
     await supabase.from('answers').upsert({
       round: gameState.current_round,
       player,
       ...myAnswers,
     }, { onConflict: 'round,player' });
 
-    // Update game state to basta
     await supabase
       .from('game_state')
       .update({
@@ -269,7 +287,7 @@ export function useGame(player: Player | null) {
     saveAnswers();
   }, [gameState?.status]);
 
-  // ─── Basta player: wait for both answers, calculate, store results ──
+  // ─── Basta player: wait for answers, calculate, store in game_state ──
   useEffect(() => {
     if (!gameState || gameState.status !== 'basta' || !player) return;
     if (gameState.basta_by !== player) return;
@@ -277,13 +295,13 @@ export function useGame(player: Player | null) {
     let active = true;
 
     const run = async () => {
-      // Poll until both real answers exist (up to 10 seconds)
+      // Poll until both answers exist
       for (let attempt = 0; attempt < 10; attempt++) {
         if (!active) return;
         const { data } = await supabase.from('answers')
           .select('*')
           .eq('round', gameState.current_round)
-          .neq('player', RESULTS_PLAYER_KEY);
+          .in('player', ['jose', 'nicol']);
 
         if (data && data.length >= 2) break;
         await new Promise(r => setTimeout(r, 1000));
@@ -297,20 +315,15 @@ export function useGame(player: Player | null) {
     return () => { active = false; };
   }, [gameState?.status, gameState?.basta_by, gameState?.current_round, player]);
 
-  /**
-   * Single source of truth: calculate points, store them in DB,
-   * update scores, and transition to results.
-   */
   const doCalculateAndStore = async () => {
     if (!gameState) return;
     if (resultsCalculatedForRound.current === gameState.current_round) return;
     resultsCalculatedForRound.current = gameState.current_round;
 
-    // Fetch answers from DB
     const { data: allAnswers } = await supabase.from('answers')
       .select('*')
       .eq('round', gameState.current_round)
-      .neq('player', RESULTS_PLAYER_KEY);
+      .in('player', ['jose', 'nicol']);
 
     let joseA = allAnswers?.find((a: any) => a.player === 'jose') as any;
     let nicolA = allAnswers?.find((a: any) => a.player === 'nicol') as any;
@@ -318,7 +331,6 @@ export function useGame(player: Player | null) {
     const letter = normalizeLetter(gameState.current_letter) ?? '';
     if (!letter) return;
 
-    // Insert empty answers if a player didn't save in time
     if (!joseA) {
       joseA = { player: 'jose', round: gameState.current_round, ...emptyAnswers };
       await supabase.from('answers').upsert(joseA, { onConflict: 'round,player' });
@@ -328,7 +340,6 @@ export function useGame(player: Player | null) {
       await supabase.from('answers').upsert(nicolA, { onConflict: 'round,player' });
     }
 
-    // Calculate points
     const { jPoints, nPoints } = calculatePoints(joseA, nicolA, letter);
 
     const roundResultsData: StoredRoundResults = {
@@ -337,68 +348,26 @@ export function useGame(player: Player | null) {
       points: { jose: jPoints, nicol: nPoints },
     };
 
-    // *** STORE results in DB as a special "answers" row ***
-    // We serialize the full results into the `nombre` field as JSON.
-    // This ensures BOTH players read the EXACT same calculated results.
-    await supabase.from('answers').upsert({
-      round: gameState.current_round,
-      player: RESULTS_PLAYER_KEY,
-      nombre: JSON.stringify(roundResultsData),
-      apellido: null, color: null, animal: null,
-      fruta_verdura: null, cosa: null, pais: null,
-    }, { onConflict: 'round,player' });
-
     // Update total scores atomically
     const joseRoundTotal = Object.values(jPoints).reduce((a, b) => a + b, 0);
     const nicolRoundTotal = Object.values(nPoints).reduce((a, b) => a + b, 0);
     await supabase.rpc('increment_score', { p_player: 'jose', p_points: joseRoundTotal });
     await supabase.rpc('increment_score', { p_player: 'nicol', p_points: nicolRoundTotal });
 
-    // Set results locally for the calculating player
+    // Set results locally for the calculating player (instant feedback)
     setRoundResults(roundResultsData);
 
-    // Transition game status
+    // *** STORE results in basta_by as JSON and transition status ***
+    // Both players will receive this via realtime/polling and parse it
     const newStatus = gameState.current_round >= TOTAL_ROUNDS ? 'finished' : 'results';
     await supabase.from('game_state')
-      .update({ status: newStatus, updated_at: new Date().toISOString() })
+      .update({
+        status: newStatus,
+        basta_by: JSON.stringify(roundResultsData),
+        updated_at: new Date().toISOString(),
+      })
       .eq('id', gameState.id);
   };
-
-  // ─── Both players: load stored results from DB when status is results/finished ──
-  useEffect(() => {
-    const isResultsPhase = gameState?.status === 'results' || gameState?.status === 'finished';
-    if (!gameState || !isResultsPhase || roundResults) return;
-
-    let active = true;
-
-    const loadResults = async () => {
-      // Poll until the stored results row exists (up to 10 seconds)
-      for (let attempt = 0; attempt < 10; attempt++) {
-        if (!active) return;
-
-        const { data } = await supabase.from('answers')
-          .select('nombre')
-          .eq('round', gameState.current_round)
-          .eq('player', RESULTS_PLAYER_KEY)
-          .maybeSingle();
-
-        if (data?.nombre) {
-          try {
-            const parsed = JSON.parse(data.nombre) as StoredRoundResults;
-            setRoundResults(parsed);
-            return; // Success!
-          } catch (e) {
-            console.error('Failed to parse stored results:', e);
-          }
-        }
-
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    };
-
-    loadResults();
-    return () => { active = false; };
-  }, [gameState?.status, gameState?.current_round, roundResults]);
 
   // ─── Next Round ──────────────────────────────────────
   const nextRound = useCallback(async () => {
@@ -417,10 +386,8 @@ export function useGame(player: Player | null) {
 
   // ─── Restart Game ────────────────────────────────────
   const restartGame = useCallback(async () => {
-    // Reset scores
     await supabase.from('scores').update({ total_score: 0, updated_at: new Date().toISOString() }).eq('player', 'jose');
     await supabase.from('scores').update({ total_score: 0, updated_at: new Date().toISOString() }).eq('player', 'nicol');
-    // Delete ALL answers (including stored results rows)
     await supabase.from('answers').delete().not('id', 'is', null);
 
     const targetGameId = gameState?.id ?? (
