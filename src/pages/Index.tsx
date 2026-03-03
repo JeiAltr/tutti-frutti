@@ -266,10 +266,20 @@ const Index = () => {
           </motion.div>
         )}
 
-        {/* BASTA waiting for results */}
-        {isBasta && !roundResults && (
+        {/* BASTA or RESULTS waiting for data */}
+        {((isBasta && !roundResults) || (isResults && !roundResults)) && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center space-y-4">
-            <p className="text-lg text-muted-foreground">Calculando resultados...</p>
+            <p className="text-lg text-muted-foreground">
+              {isBasta ? 'Calculando resultados...' : 'Cargando resultados...'}
+            </p>
+            {isResults && (
+              <Button
+                onClick={nextRound}
+                className="w-full bg-primary text-primary-foreground hover:bg-primary/90 rounded-xl py-5 text-lg mt-4"
+              >
+                Siguiente Ronda 💞
+              </Button>
+            )}
           </motion.div>
         )}
 
